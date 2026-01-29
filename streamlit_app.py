@@ -2,9 +2,9 @@
 🔧 Conti Motors Parts Database Builder
 ======================================
 WITH GOOGLE SHEETS DIRECT INTEGRATION
-FIXED: Form inputs no longer reset when typing
+FIXED: Better error handling for sheet data
 
-Version: 2.1
+Version: 2.2
 """
 
 import streamlit as st
@@ -77,16 +77,6 @@ st.markdown("""
         font-size: 0.8rem;
         font-weight: bold;
     }
-    .alt-tag {
-        background: #e8f4f8;
-        border: 1px solid #4dabf7;
-        color: #1971c2;
-        padding: 0.3rem 0.6rem;
-        border-radius: 6px;
-        margin: 0.2rem;
-        display: inline-block;
-        font-family: monospace;
-    }
     .oe-tag {
         background: #fff3e6;
         border: 1px solid #ff6b35;
@@ -122,8 +112,6 @@ if 'search_result' not in st.session_state:
     st.session_state.search_result = None
 if 'save_success' not in st.session_state:
     st.session_state.save_success = None
-if 'last_search_query' not in st.session_state:
-    st.session_state.last_search_query = ""
 
 # ============ GOOGLE SHEETS FUNCTIONS ============
 
@@ -141,7 +129,6 @@ def get_google_sheets_service():
         service = build('sheets', 'v4', credentials=creds)
         return service
     except Exception as e:
-        st.error(f"Google Sheets connection error: {e}")
         return None
 
 
@@ -157,7 +144,7 @@ def append_to_sheet(service, spreadsheet_id, sheet_name, values):
     """Append a row to a specific sheet"""
     try:
         body = {'values': [values]}
-        result = service.spreadsheets().values().append(
+        service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
             range=f'{sheet_name}!A:Z',
             valueInputOption='USER_ENTERED',
@@ -170,20 +157,60 @@ def append_to_sheet(service, spreadsheet_id, sheet_name, values):
         return False
 
 
-def read_sheet(service, spreadsheet_id, sheet_name):
-    """Read all data from a sheet"""
+def read_sheet_as_df(service, spreadsheet_id, sheet_name):
+    """Read sheet and return as DataFrame with proper error handling"""
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=f'{sheet_name}!A:Z'
         ).execute()
         values = result.get('values', [])
-        if values:
-            headers = values[0]
-            data = values[1:] if len(values) > 1 else []
-            return headers, data
-        return [], []
-    except HttpError as e:
+        
+        if not values:
+            return pd.DataFrame()
+        
+        headers = values[0]
+        data = values[1:] if len(values) > 1 else []
+        
+        if not data:
+            return pd.DataFrame(columns=headers)
+        
+        # Normalize rows to have same length as headers
+        normalized_data = []
+        for row in data:
+            # Pad row with empty strings if shorter than headers
+            if len(row) < len(headers):
+                row = row + [''] * (len(headers) - len(row))
+            # Truncate if longer than headers
+            elif len(row) > len(headers):
+                row = row[:len(headers)]
+            normalized_data.append(row)
+        
+        df = pd.DataFrame(normalized_data, columns=headers)
+        return df
+        
+    except Exception as e:
+        st.error(f"Error reading sheet: {e}")
+        return pd.DataFrame()
+
+
+def read_sheet_raw(service, spreadsheet_id, sheet_name):
+    """Read raw data from sheet"""
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f'{sheet_name}!A:Z'
+        ).execute()
+        values = result.get('values', [])
+        
+        if not values:
+            return [], []
+        
+        headers = values[0]
+        data = values[1:] if len(values) > 1 else []
+        return headers, data
+        
+    except Exception as e:
         return [], []
 
 
@@ -198,8 +225,13 @@ def initialize_sheet_headers(service, spreadsheet_id):
     
     for sheet_name, header_row in headers.items():
         try:
-            existing_headers, _ = read_sheet(service, spreadsheet_id, sheet_name)
-            if not existing_headers:
+            result = service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f'{sheet_name}!A1:Z1'
+            ).execute()
+            existing = result.get('values', [])
+            
+            if not existing or not existing[0]:
                 body = {'values': [header_row]}
                 service.spreadsheets().values().update(
                     spreadsheetId=spreadsheet_id,
@@ -214,11 +246,11 @@ def initialize_sheet_headers(service, spreadsheet_id):
 def get_next_part_id(service, spreadsheet_id):
     """Get next part ID from sheet"""
     try:
-        _, data = read_sheet(service, spreadsheet_id, 'Parts_Master')
+        _, data = read_sheet_raw(service, spreadsheet_id, 'Parts_Master')
         if data:
             max_id = 0
             for row in data:
-                if row and row[0].startswith('P'):
+                if row and len(row) > 0 and row[0].startswith('P'):
                     try:
                         num = int(row[0][1:])
                         max_id = max(max_id, num)
@@ -347,17 +379,6 @@ def search_spareto(query):
                 if text and len(text) > 2 and text not in result['vehicles']:
                     result['vehicles'].append(text)
             
-            for table in soup.find_all('table'):
-                for row in table.find_all('tr'):
-                    cells = row.find_all(['td', 'th'])
-                    if len(cells) >= 2:
-                        label = cells[0].get_text(strip=True)
-                        value = cells[1].get_text(strip=True)
-                        if label and value and len(label) < 40:
-                            skip = ['action', 'price', 'availability', 'check']
-                            if not any(x in label.lower() for x in skip):
-                                result['specifications'][label] = value
-            
             return result
             
         except Exception as e:
@@ -372,77 +393,86 @@ def save_to_google_sheets(service, spreadsheet_id, part_data, alternatives, inve
     part_id = get_next_part_id(service, spreadsheet_id)
     today = datetime.now().strftime("%Y-%m-%d")
     
-    # 1. Save to Parts_Master
+    # 1. Save to Parts_Master (11 columns)
     parts_row = [
-        part_id,
-        part_data['query'],
-        inventory_info['brand'],
-        inventory_info['category'],
-        inventory_info['sub_category'],
-        part_data.get('title', ''),
-        part_data.get('title', ''),
-        ', '.join(part_data.get('vehicles', [])[:5]),
-        '',
-        '',
-        today
+        part_id,                                    # Part_ID
+        part_data['query'],                         # OE_Number
+        inventory_info['brand'],                    # Brand
+        inventory_info['category'],                 # Category
+        inventory_info['sub_category'],             # Sub_Category
+        part_data.get('title', ''),                 # Design_Type
+        part_data.get('title', ''),                 # Description
+        ', '.join(part_data.get('vehicles', [])[:5]), # Fits_Models
+        '',                                         # Fits_Years
+        '',                                         # Notes
+        today                                       # Date_Added
     ]
     append_to_sheet(service, spreadsheet_id, 'Parts_Master', parts_row)
     
-    # 2. Save to Alternatives
+    # 2. Save to Alternatives (13 columns)
     for alt in alternatives:
         is_default = 'Yes' if alt['part_number'] == selected_default else 'No'
         alt_row = [
-            part_id,
-            part_data['query'],
-            alt['part_number'],
-            alt['manufacturer'],
-            is_default,
-            alt.get('price_eur', ''),
-            str(inventory_info.get('price_myr', '')),
-            alt.get('source', 'Spareto'),
-            alt.get('url', ''),
-            'In Stock',
-            '⭐⭐⭐⭐' if is_default == 'Yes' else '',
-            '',
-            today
+            part_id,                                # Part_ID
+            part_data['query'],                     # OE_Number
+            alt['part_number'],                     # Alternative_PN
+            alt['manufacturer'],                    # Manufacturer
+            is_default,                             # Is_Default
+            alt.get('price_eur', ''),               # Price_EUR
+            str(inventory_info.get('price_myr', '')), # Price_MYR
+            alt.get('source', 'Spareto'),           # Source
+            alt.get('url', ''),                     # Source_URL
+            'In Stock',                             # Availability
+            '⭐⭐⭐⭐' if is_default == 'Yes' else '', # Quality_Rating
+            '',                                     # Notes
+            today                                   # Date_Added
         ]
         append_to_sheet(service, spreadsheet_id, 'Alternatives', alt_row)
     
-    # 3. Save to Inventory
+    # 3. Save to Inventory (17 columns)
     default_alt = next((a for a in alternatives if a['part_number'] == selected_default), alternatives[0] if alternatives else {})
     qty = inventory_info.get('qty', 0)
     min_stock = inventory_info.get('min_stock', 2)
     reorder = 'Yes' if qty < min_stock else 'No'
     
     inv_row = [
-        part_id,
-        part_data['query'],
-        selected_default,
-        default_alt.get('manufacturer', ''),
-        inventory_info['sub_category'],
-        str(qty),
-        str(min_stock),
-        str(inventory_info.get('max_stock', 10)),
-        inventory_info.get('location', ''),
-        '',
-        reorder,
-        today,
-        '',
-        str(inventory_info.get('price_myr', '')),
-        inventory_info.get('supplier', ''),
-        '',
-        ''
+        part_id,                                    # Part_ID
+        part_data['query'],                         # OE_Number
+        selected_default,                           # Default_PN
+        default_alt.get('manufacturer', ''),        # Manufacturer
+        inventory_info['sub_category'],             # Category
+        str(qty),                                   # Qty_In_Stock
+        str(min_stock),                             # Min_Stock_Level
+        str(inventory_info.get('max_stock', 10)),   # Max_Stock_Level
+        inventory_info.get('location', ''),         # Location
+        '',                                         # Bin_Number
+        reorder,                                    # Reorder_Needed
+        today,                                      # Last_Purchase_Date
+        '',                                         # Last_Purchase_Qty
+        str(inventory_info.get('price_myr', '')),   # Last_Purchase_Price_MYR
+        inventory_info.get('supplier', ''),         # Supplier
+        '',                                         # Supplier_Contact
+        ''                                          # Notes
     ]
     append_to_sheet(service, spreadsheet_id, 'Inventory', inv_row)
     
-    # 4. Save to Vehicles
+    # 4. Save to Vehicles (14 columns)
     for vehicle in part_data.get('vehicles', [])[:10]:
         veh_row = [
-            part_id,
-            part_data['query'],
-            inventory_info['brand'],
-            vehicle,
-            '', '', '', '', '', '', '', '', '', ''
+            part_id,                                # Part_ID
+            part_data['query'],                     # OE_Number
+            inventory_info['brand'],                # Car_Brand
+            vehicle,                                # Model
+            '',                                     # Body_Code
+            '',                                     # Generation
+            '',                                     # Year_From
+            '',                                     # Year_To
+            '',                                     # Engine_Code
+            '',                                     # Engine_Size_CC
+            '',                                     # KW
+            '',                                     # HP
+            '',                                     # Fuel_Type
+            ''                                      # Notes
         ]
         append_to_sheet(service, spreadsheet_id, 'Vehicles', veh_row)
     
@@ -471,37 +501,40 @@ with col_status2:
     if sheets_service and spreadsheet_id:
         st.markdown('<p style="text-align:center;"><span class="connected-badge">✅ Connected to Google Sheets</span></p>', unsafe_allow_html=True)
     else:
-        st.markdown('<p style="text-align:center;"><span class="disconnected-badge">❌ Not Connected - Check Settings</span></p>', unsafe_allow_html=True)
+        st.markdown('<p style="text-align:center;"><span class="disconnected-badge">❌ Not Connected</span></p>', unsafe_allow_html=True)
 
 # Stats row
 if sheets_service and spreadsheet_id:
-    _, parts_data = read_sheet(sheets_service, spreadsheet_id, 'Parts_Master')
-    _, alt_data = read_sheet(sheets_service, spreadsheet_id, 'Alternatives')
-    _, inv_data = read_sheet(sheets_service, spreadsheet_id, 'Inventory')
-    
-    parts_count = len(parts_data) if parts_data else 0
-    alt_count = len(alt_data) if alt_data else 0
-    
-    total_stock = 0
-    reorder_count = 0
-    if inv_data:
-        for row in inv_data:
-            try:
-                total_stock += int(row[5]) if len(row) > 5 and row[5] else 0
-                if len(row) > 10 and row[10] == 'Yes':
-                    reorder_count += 1
-            except:
-                pass
-    
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.markdown(f'<div class="stat-card"><div class="stat-number">{parts_count}</div><div class="stat-label">Parts in DB</div></div>', unsafe_allow_html=True)
-    with col2:
-        st.markdown(f'<div class="stat-card"><div class="stat-number">{alt_count}</div><div class="stat-label">Alternatives</div></div>', unsafe_allow_html=True)
-    with col3:
-        st.markdown(f'<div class="stat-card"><div class="stat-number">{total_stock}</div><div class="stat-label">Items in Stock</div></div>', unsafe_allow_html=True)
-    with col4:
-        st.markdown(f'<div class="stat-card"><div class="stat-number">{reorder_count}</div><div class="stat-label">Need Reorder</div></div>', unsafe_allow_html=True)
+    try:
+        parts_df = read_sheet_as_df(sheets_service, spreadsheet_id, 'Parts_Master')
+        alt_df = read_sheet_as_df(sheets_service, spreadsheet_id, 'Alternatives')
+        inv_df = read_sheet_as_df(sheets_service, spreadsheet_id, 'Inventory')
+        
+        parts_count = len(parts_df) if not parts_df.empty else 0
+        alt_count = len(alt_df) if not alt_df.empty else 0
+        
+        total_stock = 0
+        reorder_count = 0
+        if not inv_df.empty and 'Qty_In_Stock' in inv_df.columns:
+            for _, row in inv_df.iterrows():
+                try:
+                    total_stock += int(row.get('Qty_In_Stock', 0) or 0)
+                    if row.get('Reorder_Needed') == 'Yes':
+                        reorder_count += 1
+                except:
+                    pass
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.markdown(f'<div class="stat-card"><div class="stat-number">{parts_count}</div><div class="stat-label">Parts in DB</div></div>', unsafe_allow_html=True)
+        with col2:
+            st.markdown(f'<div class="stat-card"><div class="stat-number">{alt_count}</div><div class="stat-label">Alternatives</div></div>', unsafe_allow_html=True)
+        with col3:
+            st.markdown(f'<div class="stat-card"><div class="stat-number">{total_stock}</div><div class="stat-label">Items in Stock</div></div>', unsafe_allow_html=True)
+        with col4:
+            st.markdown(f'<div class="stat-card"><div class="stat-number">{reorder_count}</div><div class="stat-label">Need Reorder</div></div>', unsafe_allow_html=True)
+    except Exception as e:
+        st.warning(f"Could not load stats: {e}")
 
 st.markdown("---")
 
@@ -512,7 +545,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔍 Search & Add", "📦 Database", "�
 with tab1:
     st.markdown("### 🔍 Search for Parts")
     
-    # Search form - using a form prevents page reload on every input
+    # Search form
     with st.form(key="search_form"):
         col1, col2 = st.columns([3, 1])
         with col1:
@@ -526,7 +559,7 @@ with tab1:
     
     st.caption("💡 Type any format - with or without spaces")
     
-    # Quick examples (outside form)
+    # Quick examples
     st.markdown("**Quick Examples:**")
     ex_cols = st.columns(6)
     examples = ['11427566327', '34116860242', '04465-47060', '5K0698451A', '1K0615301AA', 'A0004203000']
@@ -534,18 +567,16 @@ with tab1:
         with ex_cols[i]:
             if st.button(ex, key=f"ex_{i}", use_container_width=True):
                 st.session_state.search_result = search_spareto(ex)
-                st.session_state.last_search_query = ex
                 st.session_state.save_success = None
                 st.rerun()
     
-    # Perform search when form submitted
+    # Perform search
     if search_btn and search_query:
         with st.spinner(f'🔍 Searching for "{search_query}"...'):
             st.session_state.search_result = search_spareto(search_query)
-            st.session_state.last_search_query = search_query
             st.session_state.save_success = None
     
-    # Show success message if just saved
+    # Show success message
     if st.session_state.save_success:
         st.markdown(f"""
         <div class="success-box">
@@ -590,28 +621,26 @@ with tab1:
         if result['products']:
             st.markdown("### 🔄 Alternative Parts")
             
-            # Show table
             alt_df = pd.DataFrame([{
                 'Manufacturer': p['manufacturer'],
                 'Part Number': p['part_number'],
                 'Price (EUR)': f"€{p['price_eur']}" if p['price_eur'] else '-',
-                'Source': p.get('source', 'Spareto')
             } for p in result['products'][:15]])
             
             st.dataframe(alt_df, use_container_width=True, hide_index=True)
             
             st.markdown("---")
             
-            # Save form - USING FORM TO PREVENT RERUNS
+            # Save form
             st.markdown("### 💾 Save to Google Sheets")
             
             if not sheets_service or not spreadsheet_id:
-                st.warning("⚠️ Google Sheets not connected. Go to Settings tab to configure.")
+                st.warning("⚠️ Google Sheets not connected. Go to Settings tab.")
             else:
                 with st.form(key="save_form"):
                     # Default selection
                     options = [f"{p['manufacturer']} - {p['part_number']}" for p in result['products'][:15]]
-                    selected_option = st.selectbox("Select Default Part", options, index=0)
+                    selected_option = st.selectbox("Select Default Part ⭐", options, index=0)
                     
                     col1, col2 = st.columns(2)
                     with col1:
@@ -625,7 +654,7 @@ with tab1:
                         qty = st.number_input("Quantity in Stock", min_value=0, value=0)
                         min_stock = st.number_input("Min Stock Level", min_value=0, value=2)
                         max_stock = st.number_input("Max Stock Level", min_value=0, value=10)
-                        price_myr = st.number_input("Your Price (MYR)", min_value=0.0, value=0.0, step=0.01)
+                        price_myr = st.number_input("Your Price (MYR)", min_value=0.0, value=0.0, step=1.0)
                         supplier = st.text_input("Supplier", placeholder="e.g., AutoParts MY")
                     
                     save_btn = st.form_submit_button("💾 Save to Google Sheets", type="primary", use_container_width=True)
@@ -664,7 +693,7 @@ with tab1:
                         st.balloons()
                         st.rerun()
         
-        # Clear search button
+        # Clear button
         if st.button("🔄 Clear & Search Again"):
             st.session_state.search_result = None
             st.session_state.save_success = None
@@ -678,25 +707,30 @@ with tab2:
         st.warning("⚠️ Google Sheets not connected.")
     else:
         if st.button("🔄 Refresh Data", key="refresh_db"):
+            st.cache_resource.clear()
             st.rerun()
         
         # Parts Master
         st.markdown("#### Parts Master")
-        headers, data = read_sheet(sheets_service, spreadsheet_id, 'Parts_Master')
-        if data:
-            df = pd.DataFrame(data, columns=headers if headers else None)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else:
-            st.info("No parts in database yet.")
+        try:
+            df = read_sheet_as_df(sheets_service, spreadsheet_id, 'Parts_Master')
+            if not df.empty:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No parts in database yet.")
+        except Exception as e:
+            st.error(f"Error loading Parts Master: {e}")
         
         # Alternatives
         st.markdown("#### Alternatives / Cross-References")
-        headers, data = read_sheet(sheets_service, spreadsheet_id, 'Alternatives')
-        if data:
-            df = pd.DataFrame(data, columns=headers if headers else None)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else:
-            st.info("No alternatives yet.")
+        try:
+            df = read_sheet_as_df(sheets_service, spreadsheet_id, 'Alternatives')
+            if not df.empty:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No alternatives yet.")
+        except Exception as e:
+            st.error(f"Error loading Alternatives: {e}")
 
 # TAB 3: Inventory
 with tab3:
@@ -706,26 +740,30 @@ with tab3:
         st.warning("⚠️ Google Sheets not connected.")
     else:
         if st.button("🔄 Refresh Inventory", key="refresh_inv"):
+            st.cache_resource.clear()
             st.rerun()
         
-        headers, data = read_sheet(sheets_service, spreadsheet_id, 'Inventory')
-        if data:
-            df = pd.DataFrame(data, columns=headers if headers else None)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-            
-            reorder_items = [row for row in data if len(row) > 10 and row[10] == 'Yes']
-            if reorder_items:
-                st.markdown("---")
-                st.warning(f"⚠️ **{len(reorder_items)} items need reordering!**")
-                for item in reorder_items:
-                    st.markdown(f"- **{item[2]}** ({item[4]}) - Stock: {item[5]}, Min: {item[6]}")
-        else:
-            st.info("No inventory data yet.")
+        try:
+            df = read_sheet_as_df(sheets_service, spreadsheet_id, 'Inventory')
+            if not df.empty:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+                
+                # Reorder alerts
+                if 'Reorder_Needed' in df.columns:
+                    reorder_items = df[df['Reorder_Needed'] == 'Yes']
+                    if not reorder_items.empty:
+                        st.markdown("---")
+                        st.warning(f"⚠️ **{len(reorder_items)} items need reordering!**")
+                        for _, item in reorder_items.iterrows():
+                            st.markdown(f"- **{item.get('Default_PN', 'N/A')}** ({item.get('Category', 'N/A')}) - Stock: {item.get('Qty_In_Stock', 0)}, Min: {item.get('Min_Stock_Level', 0)}")
+            else:
+                st.info("No inventory data yet.")
+        except Exception as e:
+            st.error(f"Error loading Inventory: {e}")
 
 # TAB 4: Vehicle Lookup
 with tab4:
     st.markdown("### 🚗 Find Parts by Vehicle")
-    st.caption("Select a vehicle to see all parts in your database that fit it.")
     
     if not sheets_service or not spreadsheet_id:
         st.warning("⚠️ Google Sheets not connected.")
@@ -733,126 +771,67 @@ with tab4:
         with st.form(key="vehicle_lookup_form"):
             col1, col2, col3 = st.columns(3)
             with col1:
-                lookup_brand = st.selectbox("Car Brand", ["All"] + BRANDS, key="veh_brand")
+                lookup_brand = st.selectbox("Car Brand", ["All"] + BRANDS)
             with col2:
-                lookup_model = st.text_input("Model (optional)", placeholder="e.g., 3 Series, A4", key="veh_model")
+                lookup_model = st.text_input("Model (optional)", placeholder="e.g., 3 Series")
             with col3:
                 st.write("")
                 st.write("")
                 lookup_btn = st.form_submit_button("🔍 Find Parts", type="primary", use_container_width=True)
         
         if lookup_btn:
-            headers, veh_data = read_sheet(sheets_service, spreadsheet_id, 'Vehicles')
-            headers_inv, inv_data = read_sheet(sheets_service, spreadsheet_id, 'Inventory')
-            
-            if veh_data:
-                matching_parts = []
-                for row in veh_data:
-                    if len(row) >= 4:
-                        car_brand = row[2] if len(row) > 2 else ''
-                        model = row[3] if len(row) > 3 else ''
-                        
-                        brand_match = lookup_brand == "All" or car_brand == lookup_brand
-                        model_match = not lookup_model or lookup_model.lower() in model.lower()
-                        
-                        if brand_match and model_match:
-                            matching_parts.append({
-                                'Part_ID': row[0],
-                                'OE_Number': row[1],
-                                'Car_Brand': car_brand,
-                                'Model': model
-                            })
+            try:
+                veh_df = read_sheet_as_df(sheets_service, spreadsheet_id, 'Vehicles')
+                inv_df = read_sheet_as_df(sheets_service, spreadsheet_id, 'Inventory')
                 
-                if matching_parts:
-                    st.success(f"✅ Found {len(matching_parts)} parts for this vehicle:")
+                if not veh_df.empty:
+                    # Filter
+                    filtered = veh_df.copy()
+                    if lookup_brand != "All" and 'Car_Brand' in filtered.columns:
+                        filtered = filtered[filtered['Car_Brand'] == lookup_brand]
+                    if lookup_model and 'Model' in filtered.columns:
+                        filtered = filtered[filtered['Model'].str.contains(lookup_model, case=False, na=False)]
                     
-                    inv_dict = {}
-                    if inv_data:
-                        for row in inv_data:
-                            if len(row) > 5:
-                                inv_dict[row[0]] = {
-                                    'Default_PN': row[2] if len(row) > 2 else '',
-                                    'Category': row[4] if len(row) > 4 else '',
-                                    'Qty': row[5] if len(row) > 5 else '0',
-                                    'Location': row[8] if len(row) > 8 else ''
-                                }
-                    
-                    results = []
-                    seen_parts = set()
-                    for part in matching_parts:
-                        if part['Part_ID'] not in seen_parts:
-                            seen_parts.add(part['Part_ID'])
-                            inv = inv_dict.get(part['Part_ID'], {})
-                            results.append({
-                                'Part ID': part['Part_ID'],
-                                'OE Number': part['OE_Number'],
-                                'Default PN': inv.get('Default_PN', ''),
-                                'Category': inv.get('Category', ''),
-                                'In Stock': inv.get('Qty', '0'),
-                                'Location': inv.get('Location', '')
-                            })
-                    
-                    st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+                    if not filtered.empty:
+                        st.success(f"✅ Found {len(filtered)} matching entries")
+                        
+                        # Merge with inventory
+                        if not inv_df.empty and 'Part_ID' in filtered.columns and 'Part_ID' in inv_df.columns:
+                            merged = filtered.merge(inv_df[['Part_ID', 'Default_PN', 'Category', 'Qty_In_Stock', 'Location']], on='Part_ID', how='left')
+                            merged = merged.drop_duplicates(subset=['Part_ID'])
+                            st.dataframe(merged, use_container_width=True, hide_index=True)
+                        else:
+                            st.dataframe(filtered, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No parts found for this vehicle.")
                 else:
-                    st.info("No parts found for this vehicle in your database.")
-            else:
-                st.info("No vehicle data in database yet.")
+                    st.info("No vehicle data in database yet.")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
 # TAB 5: Settings
 with tab5:
-    st.markdown("### ⚙️ Google Sheets Settings")
+    st.markdown("### ⚙️ Settings")
     
-    st.markdown("""
-    To connect to Google Sheets, you need to add secrets to your Streamlit app.
-    
-    #### For Streamlit Cloud:
-    
-    1. Go to your app on [share.streamlit.io](https://share.streamlit.io)
-    2. Click **"Settings"** (⚙️) → **"Secrets"**
-    3. Paste your secrets in TOML format
-    """)
-    
-    st.code("""
-[gcp_service_account]
-type = "service_account"
-project_id = "your-project-id"
-private_key_id = "your-key-id"
-private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
-client_email = "your-service@your-project.iam.gserviceaccount.com"
-client_id = "your-client-id"
-auth_uri = "https://accounts.google.com/o/oauth2/auth"
-token_uri = "https://oauth2.googleapis.com/token"
-auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-client_x509_cert_url = "your-cert-url"
-
-[spreadsheet]
-spreadsheet_id = "your-spreadsheet-id"
-    """, language="toml")
-    
-    st.markdown("---")
-    st.markdown("#### Current Status:")
-    
+    st.markdown("#### Connection Status")
     if sheets_service and spreadsheet_id:
         st.success("✅ Connected to Google Sheets!")
-        st.markdown(f"**Spreadsheet ID:** `{spreadsheet_id[:20]}...`")
+        st.code(f"Spreadsheet ID: {spreadsheet_id}")
     else:
-        st.error("❌ Not connected. Please add secrets above.")
+        st.error("❌ Not connected")
     
     st.markdown("---")
     st.markdown("#### Test Connection")
-    if st.button("🔄 Test Connection", key="test_conn"):
+    if st.button("🔄 Test Connection"):
         if sheets_service and spreadsheet_id:
             try:
-                headers, _ = read_sheet(sheets_service, spreadsheet_id, 'Parts_Master')
-                st.success(f"✅ Connection successful!")
+                df = read_sheet_as_df(sheets_service, spreadsheet_id, 'Parts_Master')
+                st.success(f"✅ Connection successful! Found {len(df)} parts.")
             except Exception as e:
-                st.error(f"❌ Connection failed: {e}")
+                st.error(f"❌ Error: {e}")
         else:
-            st.error("❌ Not configured. Add secrets first.")
+            st.error("❌ Not configured")
 
 # Footer
 st.markdown("---")
-st.markdown(
-    "<p style='text-align: center; color: #666;'>© 2025 Conti Motors • Seremban, Malaysia</p>",
-    unsafe_allow_html=True
-)
+st.markdown("<p style='text-align:center;color:#666;'>© 2025 Conti Motors • Seremban</p>", unsafe_allow_html=True)
