@@ -1,8 +1,13 @@
 """
-🔧 Conti Motors Parts Lookup - Streamlit Version V3
-===================================================
-IMPROVED: Now tries multiple search formats automatically!
-Type any format - with/without spaces - it will find results!
+🔧 Conti Motors Parts Database Builder
+======================================
+- Search parts from multiple sources (Spareto, etc.)
+- View alternatives with prices
+- Set default part
+- Save to Google Sheets database
+- Track inventory
+
+Version: 1.0
 """
 
 import streamlit as st
@@ -10,10 +15,12 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import pandas as pd
+from datetime import datetime
+import json
 
 # Page config
 st.set_page_config(
-    page_title="Conti Motors Parts Lookup",
+    page_title="Conti Motors - Parts Database Builder",
     page_icon="🔧",
     layout="wide"
 )
@@ -22,529 +29,548 @@ st.set_page_config(
 st.markdown("""
 <style>
     .main-header {
-        font-size: 2.5rem;
+        font-size: 2.2rem;
         font-weight: bold;
         color: #ff6b35;
         text-align: center;
-        margin-bottom: 0;
     }
     .sub-header {
         text-align: center;
         color: #888;
-        margin-bottom: 2rem;
+        margin-bottom: 1rem;
     }
-    .ref-tag {
+    .stat-card {
+        background: linear-gradient(135deg, #1a1a2e, #16213e);
+        padding: 1rem;
+        border-radius: 10px;
+        text-align: center;
+        border: 1px solid #333;
+    }
+    .stat-number {
+        font-size: 2rem;
+        font-weight: bold;
+        color: #ff6b35;
+    }
+    .stat-label {
+        color: #888;
+        font-size: 0.9rem;
+    }
+    .default-badge {
+        background: #51cf66;
+        color: white;
+        padding: 0.2rem 0.5rem;
+        border-radius: 4px;
+        font-size: 0.8rem;
+        font-weight: bold;
+    }
+    .alt-tag {
         background: #e8f4f8;
         border: 1px solid #4dabf7;
         color: #1971c2;
-        padding: 0.5rem 1rem;
-        border-radius: 8px;
-        margin: 0.3rem;
+        padding: 0.3rem 0.6rem;
+        border-radius: 6px;
+        margin: 0.2rem;
         display: inline-block;
         font-family: monospace;
-        font-weight: bold;
     }
     .oe-tag {
         background: #fff3e6;
         border: 1px solid #ff6b35;
         color: #d9480f;
-        padding: 0.5rem 1rem;
-        border-radius: 8px;
-        margin: 0.3rem;
+        padding: 0.3rem 0.6rem;
+        border-radius: 6px;
+        margin: 0.2rem;
         display: inline-block;
         font-family: monospace;
-        font-weight: bold;
+    }
+    .vehicle-tag {
+        background: #e6fcf5;
+        border: 1px solid #20c997;
+        color: #087f5b;
+        padding: 0.3rem 0.6rem;
+        border-radius: 6px;
+        margin: 0.2rem;
+        display: inline-block;
+    }
+    .success-box {
+        background: #d3f9d8;
+        border: 1px solid #51cf66;
+        color: #2b8a3e;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 1rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
+
+# Initialize session state for database
+if 'parts_db' not in st.session_state:
+    st.session_state.parts_db = []
+if 'alternatives_db' not in st.session_state:
+    st.session_state.alternatives_db = []
+if 'inventory_db' not in st.session_state:
+    st.session_state.inventory_db = []
+if 'vehicles_db' not in st.session_state:
+    st.session_state.vehicles_db = []
+if 'part_counter' not in st.session_state:
+    st.session_state.part_counter = 1
+
+# Categories list
+CATEGORIES = {
+    "Filters": ["Oil Filter", "Air Filter", "Fuel Filter", "Cabin Filter", "Transmission Filter"],
+    "Brakes": ["Brake Pads", "Brake Discs", "Brake Sensors", "Brake Calipers", "Brake Lines"],
+    "Suspension": ["Control Arms", "Ball Joints", "Tie Rod Ends", "Bushings", "Shock Absorbers", "Springs", "Wheel Bearings"],
+    "Engine": ["Spark Plugs", "Ignition Coils", "Belts", "Tensioners", "Gaskets", "Sensors", "Water Pump", "Thermostat"],
+    "Cooling": ["Radiator", "Coolant Hoses", "Expansion Tank", "Radiator Fan"],
+    "Electrical": ["Starter Motor", "Alternator", "Battery", "Sensors", "Switches"],
+    "Steering": ["Tie Rods", "Steering Rack", "Power Steering Pump"],
+    "Transmission": ["Clutch Kit", "Flywheel", "Gearbox Mount", "CV Joint", "Drive Shaft"],
+    "Exhaust": ["Catalytic Converter", "Muffler", "Exhaust Pipe", "Lambda Sensor"],
+    "Body": ["Mirrors", "Lights", "Wipers", "Door Parts"],
+}
+
+BRANDS = ["BMW", "Audi", "Mercedes-Benz", "Volkswagen", "Porsche", "Mini"]
 
 # Session for requests
 @st.cache_resource
 def get_session():
     session = requests.Session()
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     })
     return session
 
 
-def generate_search_variations(query):
-    """Generate multiple search variations from user input"""
-    variations = []
-    
-    # Clean input
-    original = query.strip()
-    
-    # 1. Original as-is
-    variations.append(original)
-    
-    # 2. Remove ALL spaces and special characters
-    no_spaces = re.sub(r'[\s\-\.\/]', '', original)
-    if no_spaces not in variations:
-        variations.append(no_spaces)
-    
-    # 3. Only alphanumeric
-    alphanumeric = re.sub(r'[^a-zA-Z0-9]', '', original)
-    if alphanumeric not in variations:
-        variations.append(alphanumeric)
-    
-    # 4. Uppercase version
-    upper = no_spaces.upper()
-    if upper not in variations:
-        variations.append(upper)
-    
-    # 5. Lowercase version
-    lower = no_spaces.lower()
-    if lower not in variations:
-        variations.append(lower)
-    
-    # 6. With common OE number patterns (add spaces every 2-3 digits for BMW style)
-    if len(no_spaces) >= 8 and no_spaces.isdigit():
-        # BMW style: XX XX X XXX XXX
-        spaced = f"{no_spaces[:2]} {no_spaces[2:4]} {no_spaces[4:5]} {no_spaces[5:8]} {no_spaces[8:]}"
-        if spaced.strip() not in variations:
-            variations.append(spaced.strip())
-    
-    # 7. Toyota style with dash: XXXXX-XXXXX
-    if len(no_spaces) >= 10 and '-' not in original:
-        dashed = f"{no_spaces[:5]}-{no_spaces[5:]}"
-        if dashed not in variations:
-            variations.append(dashed)
-    
-    return variations
+def generate_part_id():
+    """Generate unique part ID"""
+    part_id = f"P{st.session_state.part_counter:04d}"
+    st.session_state.part_counter += 1
+    return part_id
 
 
-def try_search_spareto(session, query):
-    """Try to search Spareto with a specific query"""
+def search_spareto(query):
+    """Search Spareto for parts"""
+    session = get_session()
     clean_query = re.sub(r'[\s\-]', '', query)
     url = f"https://spareto.com/oe/{clean_query}"
     
     try:
-        response = session.get(url, timeout=15)
-        
-        # Check if we got a valid result (not 404, not empty)
+        response = session.get(url, timeout=20)
         if response.status_code == 404:
             return None
         
         soup = BeautifulSoup(response.text, 'lxml')
         
-        # Check if page has actual product content
-        products = soup.find_all('a', href=re.compile(r'^/products/[^/]+/[^/]+$'))
-        h1 = soup.find('h1')
-        
-        if products or (h1 and 'not found' not in h1.get_text().lower()):
-            return {'url': url, 'soup': soup, 'response': response, 'query_used': query}
-        
-        return None
-    except:
-        return None
-
-
-def get_product_details(session, product_url):
-    """Fetch detailed info from a product page"""
-    try:
-        response = session.get(product_url, timeout=25)
-        if response.status_code != 200:
-            return None
-        
-        soup = BeautifulSoup(response.text, 'lxml')
-        
-        details = {
-            'specifications': {},
-            'oe_numbers': {},
-            'cross_references': {},
-            'fit_vehicles': []
+        result = {
+            'query': query,
+            'url': url,
+            'title': '',
+            'products': [],
+            'oe_numbers': [],
+            'vehicles': [],
+            'specifications': {}
         }
         
-        # === SPECIFICATIONS ===
+        # Title
+        h1 = soup.find('h1')
+        if h1:
+            result['title'] = h1.get_text(strip=True)
+        
+        # Products/Alternatives
+        seen = set()
+        for link in soup.find_all('a', href=re.compile(r'^/products/[^/]+/[^/]+$')):
+            href = link.get('href')
+            if href and href not in seen:
+                seen.add(href)
+                part_number = href.split('/')[-1].upper()
+                manufacturer = href.split('/')[-2].replace('-', ' ').title()
+                
+                price = ''
+                parent = link.find_parent(['div', 'li', 'tr'])
+                if parent:
+                    m = re.search(r'€\s*([\d,.]+)', parent.get_text())
+                    if m:
+                        price = m.group(1)
+                
+                result['products'].append({
+                    'part_number': part_number,
+                    'manufacturer': manufacturer,
+                    'price_eur': price,
+                    'url': 'https://spareto.com' + href
+                })
+        
+        # OE Numbers
+        for link in soup.find_all('a', href=re.compile(r'^/oe/')):
+            oe = link.get_text(strip=True)
+            if oe and len(oe) > 3 and oe not in result['oe_numbers']:
+                result['oe_numbers'].append(oe)
+        
+        # Vehicles
+        for link in soup.find_all('a', href=re.compile(r'/t/vehicles/')):
+            text = link.get_text(strip=True)
+            if text and len(text) > 2 and text not in result['vehicles']:
+                result['vehicles'].append(text)
+        
+        # Specifications
         for table in soup.find_all('table'):
             for row in table.find_all('tr'):
                 cells = row.find_all(['td', 'th'])
                 if len(cells) >= 2:
                     label = cells[0].get_text(strip=True)
                     value = cells[1].get_text(strip=True)
-                    if label and value and len(label) < 40 and len(value) < 100:
-                        skip = ['action', 'price', 'availability', 'check', 'details', 'manufacturer', 'part number']
+                    if label and value and len(label) < 40:
+                        skip = ['action', 'price', 'availability', 'check']
                         if not any(x in label.lower() for x in skip):
-                            details['specifications'][label] = value
+                            result['specifications'][label] = value
         
-        # === OE NUMBERS ===
-        all_oe = []
-        for link in soup.find_all('a', href=re.compile(r'^/oe/')):
-            oe = link.get_text(strip=True)
-            if oe and len(oe) > 3 and oe not in all_oe:
-                all_oe.append(oe)
-        
-        if all_oe:
-            # Try to find brand from page
-            page_text = response.text
-            brands = ['BMW', 'Toyota', 'Honda', 'VW', 'Volkswagen', 'Audi', 'Mercedes', 
-                     'Nissan', 'Mazda', 'Hyundai', 'Kia', 'Ford', 'Volvo', 'Porsche', 'Mini']
-            found_brand = 'OE'
-            for brand in brands:
-                if brand in page_text:
-                    found_brand = brand
-                    break
-            details['oe_numbers'][found_brand] = all_oe[:20]
-        
-        # === CROSS-REFERENCE NUMBERS (from product links) ===
-        product_links = soup.find_all('a', href=re.compile(r'^/products/'))
-        refs_by_brand = {}
-        for link in product_links:
-            href = link.get('href', '')
-            parts = href.split('/')
-            if len(parts) >= 4:
-                brand = parts[2].replace('-', ' ').title()
-                part_num = parts[3].upper()
-                if len(part_num) > 2 and len(part_num) < 30:
-                    if brand not in refs_by_brand:
-                        refs_by_brand[brand] = []
-                    if part_num not in refs_by_brand[brand]:
-                        refs_by_brand[brand].append(part_num)
-        
-        details['cross_references'] = refs_by_brand
-        
-        # === FIT VEHICLES ===
-        for link in soup.find_all('a', href=re.compile(r'/t/vehicles/')):
-            text = link.get_text(strip=True)
-            if text and len(text) > 3:
-                details['fit_vehicles'].append({
-                    'model': text, 'years': '', 'kw': '', 'hp': '', 'ccm': ''
-                })
-        
-        return details
+        return result
     except Exception as e:
         return None
 
 
-def search_spareto(user_query):
-    """Search Spareto by trying multiple query formats"""
-    session = get_session()
+def save_to_database(part_data, alternatives, inventory_info, selected_default):
+    """Save part data to session state database"""
+    part_id = generate_part_id()
+    today = datetime.now().strftime("%Y-%m-%d")
     
-    # Generate variations of the search query
-    variations = generate_search_variations(user_query)
+    # Save to Parts Master
+    st.session_state.parts_db.append({
+        'Part_ID': part_id,
+        'OE_Number': part_data['query'],
+        'Brand': inventory_info['brand'],
+        'Category': inventory_info['category'],
+        'Sub_Category': inventory_info['sub_category'],
+        'Design_Type': part_data.get('title', ''),
+        'Description': part_data.get('title', ''),
+        'Fits_Models': ', '.join(part_data.get('vehicles', [])[:5]),
+        'Date_Added': today
+    })
     
-    # Try each variation until one works
-    result_data = None
-    tried_queries = []
+    # Save Alternatives
+    for i, alt in enumerate(alternatives):
+        is_default = 'Yes' if alt['part_number'] == selected_default else 'No'
+        st.session_state.alternatives_db.append({
+            'Part_ID': part_id,
+            'OE_Number': part_data['query'],
+            'Alternative_PN': alt['part_number'],
+            'Manufacturer': alt['manufacturer'],
+            'Is_Default': is_default,
+            'Price_EUR': alt.get('price_eur', ''),
+            'Price_MYR': inventory_info.get('price_myr', ''),
+            'Source': 'Spareto',
+            'Source_URL': alt.get('url', ''),
+            'Date_Added': today
+        })
     
-    for query in variations:
-        if not query:
-            continue
-        tried_queries.append(query)
-        result_data = try_search_spareto(session, query)
-        if result_data:
-            break
+    # Save Inventory
+    default_alt = next((a for a in alternatives if a['part_number'] == selected_default), alternatives[0] if alternatives else {})
+    st.session_state.inventory_db.append({
+        'Part_ID': part_id,
+        'OE_Number': part_data['query'],
+        'Default_PN': selected_default,
+        'Manufacturer': default_alt.get('manufacturer', ''),
+        'Category': inventory_info['sub_category'],
+        'Qty_In_Stock': inventory_info.get('qty', 0),
+        'Min_Stock_Level': inventory_info.get('min_stock', 2),
+        'Location': inventory_info.get('location', ''),
+        'Reorder_Needed': 'Yes' if inventory_info.get('qty', 0) < inventory_info.get('min_stock', 2) else 'No',
+        'Supplier': inventory_info.get('supplier', ''),
+        'Date_Added': today
+    })
     
-    if not result_data:
-        return {
-            'error': f'No results found for "{user_query}". Tried formats: {", ".join(tried_queries[:5])}',
-            'tried_queries': tried_queries
-        }
+    # Save Vehicles
+    for vehicle in part_data.get('vehicles', []):
+        st.session_state.vehicles_db.append({
+            'Part_ID': part_id,
+            'OE_Number': part_data['query'],
+            'Car_Brand': inventory_info['brand'],
+            'Model': vehicle,
+            'Date_Added': today
+        })
     
-    # Parse the successful result
-    soup = result_data['soup']
-    url = result_data['url']
-    query_used = result_data['query_used']
-    
-    result = {
-        'query': user_query,
-        'query_used': query_used,
-        'url': url,
-        'products': [],
-        'oe_numbers': {},
-        'cross_references': {},
-        'specifications': {},
-        'fit_vehicles': [],
-        'main_title': ''
-    }
-    
-    # Title
-    h1 = soup.find('h1')
-    if h1:
-        result['main_title'] = h1.get_text(strip=True)
-    
-    # Products
-    seen = set()
-    for link in soup.find_all('a', href=re.compile(r'^/products/[^/]+/[^/]+$')):
-        href = link.get('href')
-        if href and href not in seen:
-            seen.add(href)
-            part_number = href.split('/')[-1].upper()
-            manufacturer = href.split('/')[-2].replace('-', ' ').title()
-            
-            price = ''
-            parent = link.find_parent(['div', 'li', 'tr'])
-            if parent:
-                m = re.search(r'€\s*([\d,.]+)', parent.get_text())
-                if m: 
-                    price = m.group(1)
-            
-            result['products'].append({
-                'Manufacturer': manufacturer,
-                'Part Number': part_number,
-                'Price (EUR)': price if price else '-',
-                'URL': 'https://spareto.com' + href
-            })
-    
-    # Get details from first product page
-    if result['products']:
-        details = get_product_details(session, result['products'][0]['URL'])
-        if details:
-            result['specifications'] = details['specifications']
-            result['oe_numbers'] = details['oe_numbers']
-            result['cross_references'] = details['cross_references']
-            result['fit_vehicles'] = details['fit_vehicles']
-    
-    # Fallback: Get OE numbers from main page
-    if not result['oe_numbers']:
-        all_oe = []
-        for link in soup.find_all('a', href=re.compile(r'^/oe/')):
-            oe = link.get_text(strip=True)
-            if oe and len(oe) > 3 and oe not in all_oe:
-                all_oe.append(oe)
-        if all_oe:
-            result['oe_numbers']['OE'] = all_oe[:20]
-    
-    # Fallback: Build cross-references from products list
-    if not result['cross_references'] and result['products']:
-        refs_by_brand = {}
-        for p in result['products']:
-            brand = p['Manufacturer']
-            part = p['Part Number']
-            if brand not in refs_by_brand:
-                refs_by_brand[brand] = []
-            if part not in refs_by_brand[brand]:
-                refs_by_brand[brand].append(part)
-        result['cross_references'] = refs_by_brand
-    
-    return result
+    return part_id
 
 
 # ============ UI ============
 
 st.markdown('<h1 class="main-header">🔧 Conti Motors</h1>', unsafe_allow_html=True)
-st.markdown('<p class="sub-header">Parts Lookup System - Search Spareto.com</p>', unsafe_allow_html=True)
+st.markdown('<p class="sub-header">Parts Database Builder - Search, Add & Track Inventory</p>', unsafe_allow_html=True)
 
-# Search box
-col1, col2, col3 = st.columns([1, 2, 1])
+# Stats row
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.markdown(f"""
+    <div class="stat-card">
+        <div class="stat-number">{len(st.session_state.parts_db)}</div>
+        <div class="stat-label">Parts in DB</div>
+    </div>
+    """, unsafe_allow_html=True)
 with col2:
-    oe_input = st.text_input(
-        "Enter OE Number or Part Number",
-        placeholder="Type any format: 31316851335 or 31 31 6 851 335",
-        label_visibility="collapsed"
-    )
-    
-    st.caption("💡 Type any format - with or without spaces - we'll find it!")
-    
-    col_a, col_b, col_c = st.columns([1, 1, 1])
-    with col_b:
-        search_btn = st.button("🔍 Search Spareto", type="primary", use_container_width=True)
+    st.markdown(f"""
+    <div class="stat-card">
+        <div class="stat-number">{len(st.session_state.alternatives_db)}</div>
+        <div class="stat-label">Alternatives</div>
+    </div>
+    """, unsafe_allow_html=True)
+with col3:
+    total_stock = sum(item.get('Qty_In_Stock', 0) for item in st.session_state.inventory_db)
+    st.markdown(f"""
+    <div class="stat-card">
+        <div class="stat-number">{total_stock}</div>
+        <div class="stat-label">Items in Stock</div>
+    </div>
+    """, unsafe_allow_html=True)
+with col4:
+    reorder_count = sum(1 for item in st.session_state.inventory_db if item.get('Reorder_Needed') == 'Yes')
+    st.markdown(f"""
+    <div class="stat-card">
+        <div class="stat-number">{reorder_count}</div>
+        <div class="stat-label">Need Reorder</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-# Quick examples
 st.markdown("---")
-st.markdown("**Quick Examples:** ")
-example_cols = st.columns(4)
-examples = ['31316851335', '11427566327', '04465-47060', '5K0698451A']
-for i, ex in enumerate(examples):
-    with example_cols[i]:
-        if st.button(ex, key=f"ex_{i}"):
-            st.session_state['search_query'] = ex
-            st.rerun()
 
-# Check for session state search
-if 'search_query' in st.session_state:
-    oe_input = st.session_state['search_query']
-    search_btn = True
-    del st.session_state['search_query']
+# Tabs
+tab1, tab2, tab3, tab4 = st.tabs(["🔍 Search & Add Parts", "📦 View Database", "📊 Inventory", "📥 Export"])
 
-# Search
-if search_btn and oe_input:
-    with st.spinner(f'🔍 Searching for "{oe_input}"... (trying multiple formats)'):
-        result = search_spareto(oe_input)
+# TAB 1: Search & Add Parts
+with tab1:
+    st.markdown("### Search for Parts")
     
-    if 'error' in result:
-        st.error(f"⚠️ {result['error']}")
-        if 'tried_queries' in result:
-            st.info(f"Tried these formats: {', '.join(result['tried_queries'][:5])}")
-    else:
-        # Show which format worked
-        if result.get('query_used') and result['query_used'] != oe_input:
-            st.info(f"✅ Found results using format: `{result['query_used']}`")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        search_query = st.text_input(
+            "Enter OE Number or Part Number",
+            placeholder="e.g., 11427566327 or HU816X",
+            label_visibility="collapsed"
+        )
+    with col2:
+        search_btn = st.button("🔍 Search", type="primary", use_container_width=True)
+    
+    st.caption("💡 Type any format - with or without spaces")
+    
+    # Quick examples
+    st.markdown("**Quick Examples:**")
+    ex_cols = st.columns(6)
+    examples = ['11427566327', '34116860242', '04465-47060', '5K0698451A', '1K0615301AA', 'A0004203000']
+    for i, ex in enumerate(examples):
+        with ex_cols[i]:
+            if st.button(ex, key=f"ex_{i}", use_container_width=True):
+                search_query = ex
+                search_btn = True
+    
+    # Search results
+    if search_btn and search_query:
+        with st.spinner(f'🔍 Searching for "{search_query}"...'):
+            result = search_spareto(search_query)
         
-        # Title
-        if result.get('main_title'):
-            st.success(f"**{result['main_title']}**")
-        
-        st.markdown(f"🔗 [View on Spareto.com]({result['url']})")
-        
-        # Tabs
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "🔧 Products", 
-            "📐 Specs", 
-            "📋 OE Numbers", 
-            "🔄 Reference Numbers",
-            "🚗 Vehicles"
-        ])
-        
-        # Tab 1: Products
-        with tab1:
-            if result['products']:
-                st.markdown(f"**Found {len(result['products'])} replacement parts:**")
-                df = pd.DataFrame(result['products'])
-                st.dataframe(df, use_container_width=True, hide_index=True)
-                
-                csv = df.to_csv(index=False)
-                st.download_button(
-                    "📥 Download Products CSV",
-                    csv,
-                    f"spareto_{oe_input}_products.csv",
-                    "text/csv"
-                )
-            else:
-                st.info("No products found")
-        
-        # Tab 2: Specifications
-        with tab2:
-            if result['specifications']:
-                cols = st.columns(3)
-                for i, (key, value) in enumerate(result['specifications'].items()):
-                    with cols[i % 3]:
-                        st.metric(key, value)
-            else:
-                st.info("No specifications found")
-        
-        # Tab 3: OE Numbers
-        with tab3:
-            if result['oe_numbers']:
-                st.markdown("**Original Equipment Numbers (from car manufacturers):**")
-                for brand, numbers in result['oe_numbers'].items():
-                    st.markdown(f"**{brand}:**")
-                    tags_html = ''.join([f'<span class="oe-tag">{num}</span>' for num in numbers])
-                    st.markdown(tags_html, unsafe_allow_html=True)
-                    st.markdown("")
-            else:
-                st.info("No OE numbers found")
-        
-        # Tab 4: Cross-Reference Numbers
-        with tab4:
-            if result['cross_references']:
-                st.markdown("**Cross-Reference Numbers (aftermarket brands):**")
-                for brand, numbers in result['cross_references'].items():
-                    st.markdown(f"**{brand}:**")
-                    tags_html = ''.join([f'<span class="ref-tag">{num}</span>' for num in numbers])
-                    st.markdown(tags_html, unsafe_allow_html=True)
-                    st.markdown("")
-                
-                # Download
-                ref_data = []
-                for brand, numbers in result['cross_references'].items():
-                    for num in numbers:
-                        ref_data.append({'Brand': brand, 'Reference Number': num})
-                if ref_data:
-                    ref_df = pd.DataFrame(ref_data)
-                    ref_csv = ref_df.to_csv(index=False)
-                    st.download_button(
-                        "📥 Download Reference Numbers CSV",
-                        ref_csv,
-                        f"spareto_{oe_input}_references.csv",
-                        "text/csv"
-                    )
-            else:
-                st.info("No cross-reference numbers found")
-        
-        # Tab 5: Fit Vehicles
-        with tab5:
-            if result['fit_vehicles']:
-                vehicle_data = []
-                for v in result['fit_vehicles'][:30]:
-                    if isinstance(v, dict):
-                        vehicle_data.append({
-                            'Model': v.get('model', '-'),
-                            'Years': v.get('years', '-'),
-                            'KW': v.get('kw', '-'),
-                            'HP': v.get('hp', '-'),
-                            'CCM': v.get('ccm', '-')
-                        })
-                if vehicle_data:
-                    vdf = pd.DataFrame(vehicle_data)
-                    st.dataframe(vdf, use_container_width=True, hide_index=True)
-            else:
-                st.info("No vehicle data found")
-        
-        # Download section
-        st.markdown("---")
-        st.markdown("### 📥 Download Full Report")
-        
-        full_lines = []
-        full_lines.append(f"Conti Motors Parts Lookup Report")
-        full_lines.append(f"Search Query: {oe_input}")
-        full_lines.append(f"Format Used: {result.get('query_used', oe_input)}")
-        full_lines.append(f"URL: {result.get('url', '')}")
-        full_lines.append(f"Title: {result.get('main_title', '')}")
-        full_lines.append("")
-        
-        full_lines.append("=== REPLACEMENT PARTS ===")
-        for p in result.get('products', []):
-            full_lines.append(f"{p['Manufacturer']}, {p['Part Number']}, {p['Price (EUR)']}, {p['URL']}")
-        full_lines.append("")
-        
-        full_lines.append("=== SPECIFICATIONS ===")
-        for k, v in result.get('specifications', {}).items():
-            full_lines.append(f"{k}: {v}")
-        full_lines.append("")
-        
-        full_lines.append("=== OE NUMBERS ===")
-        for brand, nums in result.get('oe_numbers', {}).items():
-            full_lines.append(f"{brand}: {', '.join(nums)}")
-        full_lines.append("")
-        
-        full_lines.append("=== CROSS-REFERENCE NUMBERS ===")
-        for brand, nums in result.get('cross_references', {}).items():
-            full_lines.append(f"{brand}: {', '.join(nums)}")
-        full_lines.append("")
-        
-        full_lines.append("=== FIT VEHICLES ===")
-        for v in result.get('fit_vehicles', []):
-            if isinstance(v, dict):
-                full_lines.append(f"{v.get('model', '-')}")
-        
-        full_text = '\n'.join(full_lines)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                "📥 Download Full Report (TXT)",
-                full_text,
-                f"spareto_{oe_input}_full_report.txt",
-                "text/plain",
-                use_container_width=True
-            )
-        with col2:
-            csv_data = {
-                'Query': [oe_input],
-                'Format Used': [result.get('query_used', '')],
-                'Title': [result.get('main_title', '')],
-                'Products Count': [len(result.get('products', []))],
-                'OE Numbers': ['; '.join([f"{b}: {', '.join(n)}" for b, n in result.get('oe_numbers', {}).items()])],
-                'Cross References': ['; '.join([f"{b}: {', '.join(n)}" for b, n in result.get('cross_references', {}).items()])]
-            }
-            full_df = pd.DataFrame(csv_data)
-            full_csv = full_df.to_csv(index=False)
+        if not result:
+            st.error(f"⚠️ No results found for '{search_query}'")
+        else:
+            st.success(f"✅ Found: **{result.get('title', search_query)}**")
+            st.markdown(f"🔗 [View on Spareto.com]({result['url']})")
             
+            # Display OE Numbers
+            if result['oe_numbers']:
+                st.markdown("**📋 OE Numbers:**")
+                oe_html = ''.join([f'<span class="oe-tag">{oe}</span>' for oe in result['oe_numbers'][:10]])
+                st.markdown(oe_html, unsafe_allow_html=True)
+            
+            # Display Vehicles
+            if result['vehicles']:
+                st.markdown("**🚗 Fits Vehicles:**")
+                v_html = ''.join([f'<span class="vehicle-tag">{v}</span>' for v in result['vehicles'][:8]])
+                st.markdown(v_html, unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            # Alternatives table with selection
+            if result['products']:
+                st.markdown("### 🔄 Alternative Parts - Select Default")
+                
+                # Create selection
+                options = [f"{p['manufacturer']} - {p['part_number']} (€{p['price_eur']})" if p['price_eur'] else f"{p['manufacturer']} - {p['part_number']}" for p in result['products']]
+                
+                default_idx = 0
+                selected_default = st.radio(
+                    "Select your default part:",
+                    options,
+                    index=default_idx,
+                    key="default_selection"
+                )
+                
+                # Show alternatives table
+                alt_df = pd.DataFrame([{
+                    'Default': '⭐' if f"{p['manufacturer']} - {p['part_number']}" in selected_default else '',
+                    'Manufacturer': p['manufacturer'],
+                    'Part Number': p['part_number'],
+                    'Price (EUR)': f"€{p['price_eur']}" if p['price_eur'] else '-'
+                } for p in result['products'][:15]])
+                
+                st.dataframe(alt_df, use_container_width=True, hide_index=True)
+                
+                st.markdown("---")
+                
+                # Save to database form
+                st.markdown("### 💾 Save to Database")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    brand = st.selectbox("Car Brand", BRANDS)
+                    category = st.selectbox("Category", list(CATEGORIES.keys()))
+                    sub_category = st.selectbox("Sub-Category", CATEGORIES[category])
+                    location = st.text_input("Storage Location", placeholder="e.g., Shelf A1")
+                
+                with col2:
+                    qty = st.number_input("Quantity in Stock", min_value=0, value=0)
+                    min_stock = st.number_input("Minimum Stock Level", min_value=0, value=2)
+                    price_myr = st.number_input("Your Price (MYR)", min_value=0.0, value=0.0)
+                    supplier = st.text_input("Supplier Name", placeholder="e.g., AutoParts MY")
+                
+                if st.button("💾 Save to Database", type="primary", use_container_width=True):
+                    # Get selected default part number
+                    selected_pn = selected_default.split(" - ")[1].split(" (")[0] if " - " in selected_default else result['products'][0]['part_number']
+                    
+                    inventory_info = {
+                        'brand': brand,
+                        'category': category,
+                        'sub_category': sub_category,
+                        'location': location,
+                        'qty': qty,
+                        'min_stock': min_stock,
+                        'price_myr': price_myr,
+                        'supplier': supplier
+                    }
+                    
+                    part_id = save_to_database(result, result['products'], inventory_info, selected_pn)
+                    
+                    st.markdown(f"""
+                    <div class="success-box">
+                        ✅ <strong>Saved successfully!</strong><br>
+                        Part ID: <strong>{part_id}</strong><br>
+                        OE Number: {search_query}<br>
+                        Default Part: {selected_pn}<br>
+                        {len(result['products'])} alternatives saved
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    st.balloons()
+
+# TAB 2: View Database
+with tab2:
+    st.markdown("### 📦 Parts Database")
+    
+    if st.session_state.parts_db:
+        # Parts Master
+        st.markdown("#### Parts Master")
+        parts_df = pd.DataFrame(st.session_state.parts_db)
+        st.dataframe(parts_df, use_container_width=True, hide_index=True)
+        
+        # Alternatives
+        st.markdown("#### Alternatives / Cross-References")
+        if st.session_state.alternatives_db:
+            alt_df = pd.DataFrame(st.session_state.alternatives_db)
+            st.dataframe(alt_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No parts in database yet. Use the 'Search & Add Parts' tab to add parts.")
+
+# TAB 3: Inventory
+with tab3:
+    st.markdown("### 📊 Inventory Status")
+    
+    if st.session_state.inventory_db:
+        inv_df = pd.DataFrame(st.session_state.inventory_db)
+        
+        # Highlight reorder needed
+        st.dataframe(inv_df, use_container_width=True, hide_index=True)
+        
+        # Reorder alerts
+        reorder_items = [item for item in st.session_state.inventory_db if item.get('Reorder_Needed') == 'Yes']
+        if reorder_items:
+            st.warning(f"⚠️ {len(reorder_items)} items need reordering!")
+            for item in reorder_items:
+                st.markdown(f"- **{item['Default_PN']}** ({item['Category']}) - Stock: {item['Qty_In_Stock']}, Min: {item['Min_Stock_Level']}")
+    else:
+        st.info("No inventory data yet.")
+
+# TAB 4: Export
+with tab4:
+    st.markdown("### 📥 Export Database")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### Export as CSV")
+        
+        if st.session_state.parts_db:
+            # Parts Master CSV
+            parts_csv = pd.DataFrame(st.session_state.parts_db).to_csv(index=False)
             st.download_button(
-                "📥 Download Full Report (CSV)",
-                full_csv,
-                f"spareto_{oe_input}_full_report.csv",
+                "📥 Download Parts Master",
+                parts_csv,
+                "conti_motors_parts_master.csv",
                 "text/csv",
                 use_container_width=True
             )
+        
+        if st.session_state.alternatives_db:
+            # Alternatives CSV
+            alt_csv = pd.DataFrame(st.session_state.alternatives_db).to_csv(index=False)
+            st.download_button(
+                "📥 Download Alternatives",
+                alt_csv,
+                "conti_motors_alternatives.csv",
+                "text/csv",
+                use_container_width=True
+            )
+        
+        if st.session_state.inventory_db:
+            # Inventory CSV
+            inv_csv = pd.DataFrame(st.session_state.inventory_db).to_csv(index=False)
+            st.download_button(
+                "📥 Download Inventory",
+                inv_csv,
+                "conti_motors_inventory.csv",
+                "text/csv",
+                use_container_width=True
+            )
+    
+    with col2:
+        st.markdown("#### Export All (Combined)")
+        
+        if st.session_state.parts_db:
+            # Combined export
+            all_data = {
+                'parts_master': st.session_state.parts_db,
+                'alternatives': st.session_state.alternatives_db,
+                'inventory': st.session_state.inventory_db,
+                'vehicles': st.session_state.vehicles_db
+            }
+            
+            json_str = json.dumps(all_data, indent=2)
+            st.download_button(
+                "📥 Download All (JSON)",
+                json_str,
+                "conti_motors_full_database.json",
+                "application/json",
+                use_container_width=True
+            )
+        
+        st.markdown("---")
+        st.markdown("#### Clear Database")
+        if st.button("🗑️ Clear All Data", type="secondary"):
+            st.session_state.parts_db = []
+            st.session_state.alternatives_db = []
+            st.session_state.inventory_db = []
+            st.session_state.vehicles_db = []
+            st.session_state.part_counter = 1
+            st.success("Database cleared!")
+            st.rerun()
 
 # Footer
 st.markdown("---")
 st.markdown(
-    "<p style='text-align: center; color: #666;'>© 2025 Conti Motors • Seremban, Malaysia<br>Data from Spareto.com</p>",
+    "<p style='text-align: center; color: #666;'>© 2025 Conti Motors • Seremban, Malaysia</p>",
     unsafe_allow_html=True
 )
